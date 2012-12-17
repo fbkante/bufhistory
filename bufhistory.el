@@ -176,8 +176,8 @@
 
 ;;popwin対策。ウィンドウ構造を変更する時には、新規ウィンドウを起点とする
 (defadvice popwin:last-selected-window (after bufhistory-last-selected-window)
-  (let ((w (split-window ad-return-value)))
-    (setq ad-return-value w)))
+  (unless (window-minibuffer-p ad-return-value)
+      (setq ad-return-value (split-window ad-return-value))))
 
 (defun bufhistory-enable ()
   (ad-enable-advice 'split-window 'around 'bufhistory-split-window)
