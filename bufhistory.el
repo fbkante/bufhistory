@@ -1,8 +1,8 @@
 ;;; bufhistory.el
 
-;; Author: Koji Mitsuda <fbkante2u@gmail.com>
+;; Author: Koji Mitsuda <fbkante2u atmark gmail.com>
 ;; Keywords: convenience
-;; Version: 0.9
+;; Version: 0.91
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -25,6 +25,12 @@
 ;;    (bufhistory-mode 1)
 ;;
 
+;; 注意 bufhistory-styleを実行時に変更した際には、bufhistory-modeを一旦無効にし、再び有効にする必要がある
+
+;; version 0.91
+;; 負荷軽減のためheader-line更新のたびに文字列を計算するのをやめた。
+;; adviceではなく kill-buffer-hook を使うようにした。
+
 (eval-when-compile (require 'cl))
 
 ;;バッファリストの表示最大値 9以下の値を指定すべし。
@@ -37,7 +43,7 @@
 ;;(defvar bufhistory-style 'modeline)
 ;;(defvar bufhistory-style nil)
 
-(defconst bufhistory-header-line-format '(:eval (bufhistory-argument)))
+(defconst bufhistory-header-line-format '(:eval (bufhistory-get-epigraph)))
 
 ;;frame-title-formatを保存する
 (defvar bufhistory-frame-title-format nil)
@@ -52,33 +58,37 @@
   (let ((bl (window-parameter win 'bufhistory)))
     (delq nil (mapcar (lambda (b) (if (buffer-live-p b) b nil)) bl))))
 
-;;念の為更新した後にバッファ履歴を返す
+;;念の為更新した後にウィンドウの履歴リストを返す
 (defun bufhistory-update (&optional window)
   (let* ((w (or window (selected-window)))
          (b (window-buffer w))
          (history (bufhistory-get-history w)))
     (unless (eq b (car history))
       (setq history (cons b (delq b history)))
-      (set-window-parameter w 'bufhistory history))
+      (set-window-parameter w 'bufhistory history)
+      (set-window-parameter w 'bufhistory-epigraph (bufhistory-calc-epigraph history)))
     history))
 
-;;インデックス番号付きバッファリスト文字列を返す
-(defun bufhistory-argument ()
-  (let* ((history (bufhistory-update (selected-window)))
-         (hs (length history))
-         (i (min (1+ bufhistory-maxindex) hs 10))
+;;ウィンドウの履歴文字列を取り出す
+(defun bufhistory-get-epigraph (&optional win)
+  (window-parameter (or win (selected-window)) 'bufhistory-epigraph))
+
+;;履歴リストから履歴文字列を作成する
+(defun bufhistory-calc-epigraph (history)
+  (let* ((hs (length history))
+	 (maxindex bufhistory-maxindex)
+         (i (min (1+ maxindex) hs 10))
          (result nil))
     (when (< i hs) (push (format "-:%s" (car (last history))) result))
     (while (> i 1)
       (setq i (1- i))
       (push (format "%d:%s" i (nth i history)) result))
     (mapconcat 'identity result " ")))
-;;(concat (format "%s" (selected-window)) (mapconcat 'identity result " ")))) ;;デバッグ用
 
 ;;現状のバッファリストをエコーエリアに表示する
 (defun bufhistory-echo ()
   (when (eq bufhistory-style 'echoarea)
-    (let ((message-log-max)) (message (bufhistory-argument)))))
+    (let ((message-log-max)) (message (bufhistory-get-epigraph)))))
 
 ;;現在選択されているバッファをリスト末尾に回す
 (defun bufhistory-rotate-buffer ()
@@ -87,10 +97,18 @@
          (history (bufhistory-update w)))
     (when (> (length history) 1)
       (let* ((head (car history))
-             (tail (cdr history)))
-        (set-window-parameter w 'bufhistory (append tail (list head)))
+             (tail (cdr history))
+	     (newhistory (append tail (list head))))
+        (set-window-parameter w 'bufhistory newhistory)
+	(set-window-parameter w 'bufhistory-epigraph (bufhistory-calc-epigraph newhistory))
         (switch-to-buffer (car tail))
         (bufhistory-echo)))))
+
+;;念のためバッファ履歴を更新して、履歴文字列を返す。
+(defun bufhistory-argument ()
+  (let ((w (selected-window)))
+    (bufhistory-update w)
+    (bufhistory-get-epigraph w)))
 
 ;;バッファ選択
 (defun bufhistory-select-buffer (ch &optional quiet-p)
@@ -131,28 +149,29 @@
 (defadvice pop-to-buffer (after bufhistory-pop-to-buffer)
   (bufhistory-update))
 
-;;kill-bufferをフックするのは削除バッファを把握するためではなく、削除バッファの代替をこちらで行うため
-(defadvice kill-buffer (before bufhistory-kill-buffer)
-  (let ((buffer-or-name (ad-get-arg 0)))
-    (dolist (win (get-buffer-window-list buffer-or-name nil 'visible))
-      (with-selected-window win (bufhistory-select-buffer ?1 t)))))
+(defun bufhistory-kill-buffer-hook ()
+  (let ((buffer (current-buffer)))
+    ;;削除バッファの代替をしてしまう。
+    (dolist (win (get-buffer-window-list buffer nil 'visible))
+      (with-selected-window win (bufhistory-select-buffer ?1 t)))
+    ;;削除バッファを全ての履歴リストから消去する
+    (dolist (frame (frame-list))
+      (dolist (win (window-list frame))
+	(let ((history (delq buffer (window-parameter win 'bufhistory))))
+	  (set-window-parameter win 'bufhistory history)
+	  (set-window-parameter win 'bufhistory-epigraph (bufhistory-calc-epigraph history)))))))
 
 ;;新たにウィンドウを作成した時に、バッファ履歴とポイント位置をコピーする
 (defun bufhistory-copy-history (window-dest window-src)
-  (let ((history (bufhistory-get-history window-src)))
-    (set-window-parameter window-dest 'bufhistory history))
+  (let* ((history (bufhistory-get-history window-src))
+	 (epigraph (bufhistory-calc-epigraph history)))
+    (set-window-parameter window-dest 'bufhistory history)
+    (set-window-parameter window-dest 'bufhistory-epigraph epigraph))
   (dolist (b (buffer-list))
     (with-current-buffer b
       (when bufhistory-point-hash
         (let ((p (gethash window-src bufhistory-point-hash)))
           (when p (puthash window-dest p bufhistory-point-hash)))))))
-
-;;バッファリストが変更された時に呼び出される。
-(defun bufhistory-buffer-list-update ()
-  (dolist (win (window-list))
-    (let* ((bl (window-parameter win 'bufhistory))
-           (history (delq nil (mapcar (lambda (b) (if (buffer-live-p b) b nil)) bl))))
-      (set-window-parameter win 'bufhistory history))))
 
 (defadvice split-window (around bufhistory-split-window)
   ad-do-it
@@ -180,14 +199,13 @@
 
 (defun bufhistory-enable ()
   (ad-enable-advice 'split-window 'around 'bufhistory-split-window)
-  (ad-enable-advice 'kill-buffer 'before 'bufhistory-kill-buffer)
   (ad-enable-advice 'pop-to-buffer 'after 'bufhistory-pop-to-buffer)
   (ad-enable-advice 'switch-to-buffer 'after 'bufhistory-switch-to-buffer)
   (ad-activate 'split-window)
-  (ad-activate 'kill-buffer)
   (ad-activate 'pop-to-buffer)
   (ad-activate 'switch-to-buffer)
   (add-hook 'pre-command-hook 'bufhistory-pre-command)
+  (add-hook 'kill-buffer-hook 'bufhistory-kill-buffer-hook)
   ;;popwin対策
   (when (featurep 'popwin)
     (ad-enable-advice 'popwin:create-popup-window 'after 'bufhistory-create-popup-window)
@@ -208,14 +226,13 @@
 
 (defun bufhistory-disable ()
   (ad-disable-advice 'split-window 'around 'bufhistory-split-window)
-  (ad-disable-advice 'kill-buffer 'before 'bufhistory-kill-buffer)
   (ad-disable-advice 'pop-to-buffer 'after 'bufhistory-pop-to-buffer)
   (ad-disable-advice 'switch-to-buffer 'after 'bufhistory-switch-to-buffer)
   (ad-activate 'split-window)
-  (ad-activate 'kill-buffer)
   (ad-activate 'pop-to-buffer)
   (ad-activate 'switch-to-buffer)
   (remove-hook 'pre-command-hook 'bufhistory-pre-command)
+  (remove-hook 'kill-buffer-hook 'bufhistory-kill-buffer-hook)
   (when (featurep 'popwin)
     (ad-disable-advice 'popwin:create-popup-window 'after 'bufhistory-create-popup-window)
     (ad-disable-advice 'popwin:last-selected-window 'after 'bufhistory-last-selected-window)
